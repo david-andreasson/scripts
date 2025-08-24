@@ -8,9 +8,13 @@ BRANCH_HINT="main"
 SUBROOT="8_cloud_integration/lectures"
 STATE_DIR="/var/lib/quiz_sync"
 STATE_FILE="${STATE_DIR}/seen.txt"
-GENERATOR="$HOME/scripts/quiz_md_to_sql_V2.sh"     # your generator (non-interactive)  <-- changed
-COURSE_NAME="molnintegration"              # course name used in SQL
-NOTIFY_EMAIL="79davand@gafe.molndal.se"    # empty string => no email
+GENERATOR="$HOME/scripts/quiz_md_to_sql_V2.sh"     # your generator (non-interactive)
+COURSE_NAME="molnintegration"                      # course name used in SQL
+NOTIFY_EMAIL="79davand@gafe.molndal.se"            # empty string => no email
+
+# Counter lives in your personal repo (default here)
+COUNTER_REPO_SSH="git@github.com:david-andreasson/scripts.git"
+COUNTER_BRANCH_HINT="main"
 
 # ===== UI =====
 ok(){   printf '  \033[32m[OK]\033[0m  %s\n'   "$1"; }
@@ -18,8 +22,6 @@ fail(){ printf '  \033[31m[FAIL]\033[0m %s\n' "$1" >&2; }
 warn(){ printf '  \033[33m[WARN]\033[0m %s\n' "$1" >&2; }
 
 # ===== Helpers =====
-
-# Determine next QUESTION_NUMBER based on existing SQL under ~/quiz_out
 next_start_from_sql(){
   local course="$1" max=0 n f
   [ -d "$HOME/quiz_out" ] || { echo 1; return; }
@@ -27,7 +29,6 @@ next_start_from_sql(){
     n="$(
       awk -v course="$course" '
         {
-          # match lines like:    ('\''molnintegration'\'', 11, '...')
           if (match($0, /^[[:space:]]*\('\''([^'\'']*)'\'',[[:space:]]*([0-9]+)/, m)) {
             if (m[1] == course) {
               if (m[2] + 0 > max) max = m[2] + 0
@@ -43,7 +44,6 @@ next_start_from_sql(){
   echo $((max + 1))
 }
 
-# Count questions in a lesson dir (lines starting with N. or N) )
 count_questions_in_dir(){
   local dir="$1" cnt
   cnt="$(
@@ -60,18 +60,20 @@ for b in git sha256sum find sort join awk sed grep ssh date xargs; do
 done
 [ -d "$STATE_DIR" ] || { sudo mkdir -p "$STATE_DIR"; sudo chown "$USER":"$USER" "$STATE_DIR"; }
 
-# ===== Clone repo (SSH, with fallbacks) =====
+# ===== Clone main repo (lectures) =====
 export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519'
-WORKDIR="$(mktemp -d)"; CLONE_DIR="${WORKDIR}/repo"
+WORKDIR="$(mktemp -d)"
+CLONE_DIR="${WORKDIR}/repo"
 
-try_clone(){ local br="${1-}"
-  rm -rf "$CLONE_DIR" 2>/dev/null || true
-  if [ -n "$br" ]; then git clone --depth 1 --filter=blob:none --branch "$br" "$REPO_SSH" "$CLONE_DIR" >/dev/null 2>&1
-  else git clone --depth 1 --filter=blob:none "$REPO_SSH" "$CLONE_DIR" >/dev/null 2>&1; fi
+try_clone(){ local url="$1" br="${2-}" out="$3"
+  rm -rf "$out" 2>/dev/null || true
+  if [ -n "$br" ]; then git clone --depth 1 --filter=blob:none --branch "$br" "$url" "$out" >/dev/null 2>&1
+  else git clone --depth 1 --filter=blob:none "$url" "$out" >/dev/null 2>&1; fi
 }
-if    try_clone "$BRANCH_HINT"; then USED="$BRANCH_HINT"
-elif  try_clone master;        then USED="master"
-elif  try_clone "";            then USED="$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo default)"
+
+if    try_clone "$REPO_SSH" "$BRANCH_HINT" "$CLONE_DIR"; then USED="$BRANCH_HINT"
+elif  try_clone "$REPO_SSH" "master"      "$CLONE_DIR"; then USED="master"
+elif  try_clone "$REPO_SSH" ""            "$CLONE_DIR"; then USED="$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo default)"
 else  fail "Could not clone via SSH"; exit 1
 fi
 ok "Cloned branch '${USED}'"
@@ -80,11 +82,20 @@ TARGET="$CLONE_DIR/$SUBROOT"
 [ -d "$TARGET" ] || { fail "Path does not exist in repo: $SUBROOT"; exit 1; }
 ok "Target directory: $TARGET"
 
-# ===== Persistent next number in repo =====
-COUNTER_FILE="${CLONE_DIR}/nextnum_${COURSE_NAME}.txt"
+# ===== Clone counter repo (your scripts repo) =====
+COUNTER_CLONE_DIR="${WORKDIR}/counter"
+if    try_clone "$COUNTER_REPO_SSH" "$COUNTER_BRANCH_HINT" "$COUNTER_CLONE_DIR"; then COUNTER_BRANCH="$COUNTER_BRANCH_HINT"
+elif  try_clone "$COUNTER_REPO_SSH" "master"               "$COUNTER_CLONE_DIR"; then COUNTER_BRANCH="master"
+elif  try_clone "$COUNTER_REPO_SSH" ""                     "$COUNTER_CLONE_DIR"; then COUNTER_BRANCH="$(git -C "$COUNTER_CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo default)"
+else  fail "Could not clone counter repo via SSH"; exit 1
+fi
+
+COUNTER_FILE="${COUNTER_CLONE_DIR}/nextnum_${COURSE_NAME}.txt"
+
+# ===== Determine starting NEXT_NUM =====
 if [ -f "$COUNTER_FILE" ]; then
   NEXT_NUM="$(awk 'NR==1 && $1 ~ /^[0-9]+$/ {print $1; exit} END{if(NR==0) print 1}' "$COUNTER_FILE")"
-  ok "Starting numbering from ${NEXT_NUM} (repo counter)"
+  ok "Starting numbering from ${NEXT_NUM} (counter: david-andreasson/scripts)"
 else
   NEXT_NUM="$(next_start_from_sql "$COURSE_NAME")"
   ok "Starting numbering from ${NEXT_NUM} (from existing SQL fallback)"
@@ -103,14 +114,11 @@ SNAP="${WORKDIR}/snapshot.tsv"
 if [ ! -s "$STATE_FILE" ]; then
   cp "$SNAP" "$STATE_FILE"
   ok "Initialized state (first run) → $STATE_FILE"
+  echo "$NEXT_NUM" > "$COUNTER_FILE"
+  git -C "$COUNTER_CLONE_DIR" add "$(basename "$COUNTER_FILE")" || true
+  git -C "$COUNTER_CLONE_DIR" -c user.email="automation@local" -c user.name="quiz-automation" commit -m "Init next number for ${COURSE_NAME} -> ${NEXT_NUM}" || true
+  git -C "$COUNTER_CLONE_DIR" push origin "$COUNTER_BRANCH" || warn "Could not push counter init"
   echo "No changes to generate on first run."
-  # Skriv ut initial counter i repo om filen saknas
-  if [ ! -f "$COUNTER_FILE" ]; then
-    echo "$NEXT_NUM" > "$COUNTER_FILE"
-    git -C "$CLONE_DIR" add "$(basename "$COUNTER_FILE")" || true
-    git -C "$CLONE_DIR" -c user.email="automation@local" -c user.name="quiz-automation" commit -m "Init next number for ${COURSE_NAME} -> ${NEXT_NUM}" || true
-    git -C "$CLONE_DIR" push origin "$USED" || warn "Could not push counter init"
-  fi
   exit 0
 fi
 
@@ -140,13 +148,7 @@ if [ "$NEW_N" -eq 0 ] && [ "$MOD_N" -eq 0 ]; then
   exit 0
 fi
 
-# ===== Affected lesson directories (unique parent dirs) =====
-CHANGED_DIRS="${WORKDIR}/changed_dirs.txt"
-cat "${WORKDIR}/new.txt" "${WORKDIR}/modified.txt" 2>/dev/null | sed '/^$/d' \
-| awk -F'/' 'NF>=1{NF=NF-1; OFS="/"; print $0}' \
-| sort -u > "$CHANGED_DIRS"
-
-# ===== Run generator per lesson dir and persist NEXT_NUM in repo =====
+# ===== Run generator per lesson dir and persist counter =====
 OUT_PARENT="$HOME/quiz_out"
 mkdir -p "$OUT_PARENT"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -163,16 +165,15 @@ while IFS= read -r rel_dir; do
 
   "$GENERATOR" --url "$GH_URL" --course "$COURSE_NAME" --start "$NEXT_NUM" --output "$OUT_FILE"
 
-  # Räkna hur många frågor som faktiskt skrevs och uppdatera NEXT_NUM
   EMITTED="$(awk '/^INSERT INTO STG_QUESTIONS[[:space:]]*\(/{c++} END{print c+0}' "$OUT_FILE" 2>/dev/null || echo 0)"
   if [ "${EMITTED:-0}" -le 0 ]; then
     warn "No questions emitted for ${rel_dir}; numbering unchanged."
   else
     NEXT_NUM=$((NEXT_NUM + EMITTED))
     echo "$NEXT_NUM" > "$COUNTER_FILE"
-    git -C "$CLONE_DIR" add "$(basename "$COUNTER_FILE")" || true
-    git -C "$CLONE_DIR" -c user.email="automation@local" -c user.name="quiz-automation" commit -m "Update next number for ${COURSE_NAME} -> ${NEXT_NUM}" || true
-    git -C "$CLONE_DIR" push origin "$USED" || warn "Could not push updated counter"
+    git -C "$COUNTER_CLONE_DIR" add "$(basename "$COUNTER_FILE")" || true
+    git -C "$COUNTER_CLONE_DIR" -c user.email="automation@local" -c user.name="quiz-automation" commit -m "Update next number for ${COURSE_NAME} -> ${NEXT_NUM}" || true
+    git -C "$COUNTER_CLONE_DIR" push origin "$COUNTER_BRANCH" || warn "Could not push updated counter"
   fi
 
   if [ -n "${NOTIFY_EMAIL:-}" ]; then

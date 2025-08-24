@@ -2,92 +2,69 @@
 set -euo pipefail
 LC_ALL=C.UTF-8
 
-# --- tiny UI ---
-GREEN='\033[32m'; RED='\033[31m'; NC='\033[0m'
-ok(){   printf "  [${GREEN}OK${NC}]  %s\n" "$1"; }
-fail(){ printf "  [${RED}FAIL${NC}] %s\n" "$1"; }
+# ========= Non-interactive, strict CLI =========
+URL=""
+COURSE=""
+START=""
+OUTFILE=""
 
-echo "=========================================="
-echo "   QUIZ .md  ->  H2 SQL (SSH to GitHub)"
-echo "=========================================="
+usage() {
+  cat <<EOF
+Usage: $0 --url <github tree url> --course <name> --start <N> --output <path>
+  --url      ex: https://github.com/<owner>/<repo>/tree/<branch>/<subdir>
+  --course   course name stored in SQL
+  --start    first question number (integer)
+  --output   output .sql file path
+EOF
+}
 
-# --- prerequisites ---
-for b in git awk sed grep find ssh; do
-  command -v "$b" >/dev/null 2>&1 || { fail "Missing: $b"; exit 1; }
-done
-
-# --- flags (non-interactive by default) ---
-GITHUB_URL=""
-COURSE_NAME="molnintegration"
-OUTPUT_PATH=""
-
+# Parse strictly
 while [ $# -gt 0 ]; do
   case "$1" in
-    --url)    shift; GITHUB_URL="${1-}" ;;
-    --course) shift; COURSE_NAME="${1-}" ;;
-    --output) shift; OUTPUT_PATH="${1-}" ;;
-    -h|--help)
-      cat <<HLP
-Usage:
-  $0 --url URL [--course NAME] [--output PATH]
-
-Notes:
-  - No prompts; safe for cron/orchestrator.
-  - Start number is auto-detected from existing SQL under ~/quiz_out for the given course.
-HLP
-      exit 0
-      ;;
-    *) echo "[WARN] Unknown flag: $1" ;;
+    --url)    shift; URL="${1-}" ;;
+    --course) shift; COURSE="${1-}" ;;
+    --start)  shift; START="${1-}" ;;
+    --output) shift; OUTFILE="${1-}" ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "[FAIL] Unknown flag: $1" >&2; usage; exit 2 ;;
   esac
   shift || true
 done
 
-[ -n "${GITHUB_URL:-}" ] || { fail "Missing --url"; exit 1; }
+# Validate
+[ -n "${URL}" ]     || { echo "[FAIL] --url is required" >&2; usage; exit 2; }
+[ -n "${COURSE}" ]  || { echo "[FAIL] --course is required" >&2; usage; exit 2; }
+[[ "${START}" =~ ^[0-9]+$ ]] || { echo "[FAIL] --start must be integer" >&2; usage; exit 2; }
+[ -n "${OUTFILE}" ] || { echo "[FAIL] --output is required" >&2; usage; exit 2; }
 
-# --- parse GitHub URL (…/tree/<branch>/<subdir>) ---
-u="${GITHUB_URL#*github.com/}"
-owner="${u%%/*}"
-r="${u#*/}"               # <repo>/tree/<branch>/...
-repo="${r%%/*}"
-r="${r#*/}"               # tree/<branch>/...
-r="${r#tree/}"            # <branch>/...
+echo "=========================================="
+echo "   QUIZ .md  ->  H2 SQL (strict non-interactive)"
+echo "=========================================="
+echo "  [OK] URL='${URL}'"
+echo "  [OK] COURSE='${COURSE}'"
+echo "  [OK] START=${START}"
+echo "  [OK] OUT='${OUTFILE}'"
+
+# ========= Requirements =========
+for b in git awk sed grep find ssh; do
+  command -v "$b" >/dev/null 2>&1 || { echo "[FAIL] Missing dependency: $b" >&2; exit 1; }
+done
+
+# ========= Parse URL =========
+u="${URL#*github.com/}"         # <owner>/<repo>/tree/<branch>/...
+owner="${u%%/*}"; r="${u#*/}"
+repo="${r%%/*}"; r="${r#*/}"    # r = tree/<branch>/...
+r="${r#tree/}"                  # r = <branch>/...
 branch="${r%%/*}"
 subdir="${r#*/}"; [ "$subdir" = "$r" ] && subdir=""
 
-ok "Parsed URL → owner=${owner}, repo=${repo}, branch='${branch}', subdir='${subdir}'"
-ok "COURSE_NAME='${COURSE_NAME}'"
-
-# --- next start number from previous SQL for COURSE_NAME ---
-next_start_from_sql(){
-  local course="$1" max=0 n f
-  [ -d "$HOME/quiz_out" ] || { echo 1; return; }
-  ls -1 "$HOME/quiz_out"/quiz_*.sql "$HOME/quiz_out"/quiz_import.sql 2>/dev/null | while read -r f; do
-    n="$(
-      awk -v course="$course" '
-        {
-          # match:    ('COURSE', 11, '...')
-          if (match($0, /^[[:space:]]*\('\''([^'\'']*)'\'',[[:space:]]*([0-9]+)/, m)) {
-            if (m[1] == course) if (m[2]+0 > max) max = m[2]+0
-          }
-        }
-        END { print (max==0?0:max) }
-      ' "$f" 2>/dev/null
-    )"
-    [ -n "${n:-}" ] || n=0
-    [ "$n" -gt "$max" ] && max="$n"
-  done
-  echo $((max + 1))
-}
-START_NUMBER="$(next_start_from_sql "$COURSE_NAME")"
-ok "Starting numbering from ${START_NUMBER} (derived from previous SQL)"
-
-# --- clone via SSH (branch fallbacks) ---
+# ========= Clone via SSH =========
 export GIT_SSH_COMMAND='ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519'
 WORKDIR="$(mktemp -d)"
 CLONE_DIR="${WORKDIR}/repo"
 REMOTE="git@github.com:${owner}/${repo}.git"
 
-echo "  [..] Cloning repository via SSH…"
+echo "  [..] Cloning repo via SSH…"
 if git clone --depth 1 --filter=blob:none --branch "$branch" "$REMOTE" "$CLONE_DIR" >/dev/null 2>&1; then
   USED="$branch"
 elif git clone --depth 1 --filter=blob:none --branch main "$REMOTE" "$CLONE_DIR" >/dev/null 2>&1; then
@@ -97,31 +74,30 @@ elif git clone --depth 1 --filter=blob:none --branch master "$REMOTE" "$CLONE_DI
 elif git clone --depth 1 --filter=blob:none "$REMOTE" "$CLONE_DIR" >/dev/null 2>&1; then
   USED="$(git -C "$CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo default)"
 else
-  fail "Could not clone via SSH (ensure this server's pubkey is in GitHub)."
+  echo "[FAIL] Could not clone via SSH (check GitHub SSH key & rights)" >&2
   exit 1
 fi
-ok "Cloned '${repo}' on branch '${USED}'"
+echo "  [OK] Cloned '${repo}' (branch '${USED}')"
 
-# --- target dir ---
 TARGET="$CLONE_DIR"; [ -n "$subdir" ] && TARGET="$CLONE_DIR/$subdir"
-[ -d "$TARGET" ] || { fail "Path does not exist in repo: $subdir"; exit 1; }
-ok "Target directory: $TARGET"
+[ -d "$TARGET" ] || { echo "[FAIL] Path does not exist in repo: $subdir" >&2; exit 1; }
+echo "  [OK] Target dir: $TARGET"
 
-# --- discover quiz files ---
+# ========= Find quiz.md =========
 LIST="${WORKDIR}/quiz_files.txt"
 ( cd "$TARGET" && find . -type f -name "*quiz.md" | sort > "$LIST" )
-[ -s "$LIST" ] || { fail "No *quiz.md found under ${subdir:-<repo-root>}"; }
+[ -s "$LIST" ] || { echo "[FAIL] No *quiz.md found under ${subdir:-<repo-root>}" >&2; exit 1; }
 COUNT="$(wc -l < "$LIST" | tr -d ' ')"
-ok "Found ${COUNT} quiz file(s)"
+echo "  [OK] Found ${COUNT} quiz file(s)"
 
-# --- output path ---
-OUTDIR="$PWD/quiz_out"; mkdir -p "$OUTDIR"
-SQL_OUT="${OUTPUT_PATH:-${OUTDIR}/quiz_import.sql}"
+# ========= Prepare output =========
+OUTDIR="$(dirname "$OUTFILE")"
+mkdir -p "$OUTDIR"
 
-# --- SQL header (staging tables + truncate) ---
+# Header
 {
   printf '%s\n' \
-'-- Autogenerated by quiz-md-to-sql (SSH clone)' \
+'-- Autogenerated by quiz-md-to-sql (strict non-interactive)' \
 '-- Target: H2 Database' \
 'CREATE TABLE IF NOT EXISTS STG_QUESTIONS (' \
 '  COURSE_NAME VARCHAR(255) NOT NULL,' \
@@ -140,10 +116,9 @@ SQL_OUT="${OUTPUT_PATH:-${OUTDIR}/quiz_import.sql}"
 'TRUNCATE TABLE STG_OPTIONS;' \
 'TRUNCATE TABLE STG_QUESTIONS;' \
 ''
-} > "$SQL_OUT"
-ok "Wrote SQL header"
+} > "$OUTFILE"
 
-# --- AWK parser (to STG tables) ---
+# ========= AWK parser =========
 PARSER="${WORKDIR}/parser.awk"
 cat > "$PARSER" <<'AWK'
 BEGIN{
@@ -152,7 +127,7 @@ BEGIN{
   delete opt; delete corr;
 }
 function trim(s){ sub(/^[ \t\r\n]+/,"",s); sub(/[ \t\r\n]+$/,"",s); return s }
-function esc(s){ gsub(/\r/,"",s); gsub(/'/,"''",s); return s }
+function esc(s){ gsub(/\r/,"",s); gsub(/'\''/,"''",s); return s }
 function renumber(qtext, num,   rest){
   if (match(qtext, /^[ \t]*([0-9]+)[.)][ \t]*/)) { rest = substr(qtext, RLENGTH+1) } else { rest = qtext }
   return num ". " trim(rest)
@@ -161,79 +136,55 @@ function flush(){
   if(!haveQ) return;
   qnum_out = start_num + global_idx; global_idx++;
   q_print = renumber(q, qnum_out);
-  printf("INSERT INTO STG_QUESTIONS (COURSE_NAME, QUESTION_NUMBER, QUESTION_TEXT)\nVALUES\n    ('%s', %d, '%s');\n\n", course, qnum_out, esc(q_print));
+
+  printf("INSERT INTO STG_QUESTIONS (COURSE_NAME, QUESTION_NUMBER, QUESTION_TEXT)\nVALUES\n    (\'%s\', %d, \'%s\');\n\n", course, qnum_out, esc(q_print));
+
   printf("INSERT INTO STG_OPTIONS (COURSE_NAME, QUESTION_NUMBER, OPTION_LABEL, OPTION_TEXT, IS_CORRECT)\nVALUES\n");
   for(i=1;i<=4;i++){
-    lbl = sprintf("%c", 64+i); # A-D
+    lbl = sprintf("%c", 64+i);
     txt = (lbl in opt) ? opt[lbl] : "";
     isok = (lbl in corr) ? "TRUE" : "FALSE";
-    printf("    ('%s', %d, '%s', '%s', %s)%s\n", course, qnum_out, lbl, esc(txt), isok, (i<4?",":";"));
+    printf("    (\'%s\', %d, \'%s\', \'%s\', %s)%s\n", course, qnum_out, lbl, esc(txt), isok, (i<4?",":";"));
   }
   print "";
-  if(extra_opt>0){ printf("-- WARNING: Extra alternatives beyond A–D in %s → ignored.\n\n", FILENAME) > "/dev/stderr"; }
-  if(corr_count>1){ printf("-- NOTE: Multiple correct answers in question %d (%s)\n", qnum_out, FILENAME) > "/dev/stderr"; }
-  haveQ=0; q=""; delete opt; delete corr; corr_count=0; extra_opt=0;
+
+  haveQ=0; q=""; delete opt; delete corr;
 }
 {
   line=$0
   if(match(line,/^```/)){ in_code = !in_code; next }
   if(in_code) next
   if(match(line,/^[ \t]*---[ \t]*$/)) next
-  if(match(line,/^[ \t]*([0-9]+)[.)][ \t]+(.*)$/)){ flush(); q = trim($0); haveQ=1; next }
+
+  # question "N. text"
+  if(match(line,/^[ \t]*([0-9]+)\.[ \t]+(.*)$/)){
+    flush(); q = trim($0); haveQ=1; next
+  }
+
+  # option "A) text" (A–D)
   if(match(line,/^[ \t]*([A-Za-z])\)[ \t]+(.*)$/, m)){
-    lbl = toupper(m[1]); txt = trim(m[2]);
-    if(lbl ~ /^[A-D]$/){ opt[lbl]=txt } else { extra_opt++ }
+    lbl = toupper(m[1]); txt = trim(m[2])
+    if(lbl ~ /^[A-D]$/){ opt[lbl]=txt }
     next
   }
+
+  # answer "Rätt svar: B" eller "Rätt svar: B, D"
   if(match(line,/[Rr][äa]tt svar:[ \t]*([A-Za-z][A-Za-z, \t]*)/, m)){
     ans = m[1]; gsub(/[ \t]/,"",ans); n = split(ans, arr, /,/)
-    for(i=1;i<=n;i++){ lbl = toupper(arr[i]); if(lbl ~ /^[A-D]$/){ corr[lbl]=1; corr_count++ } else { extra_opt++ } }
+    for(i=1;i<=n;i++){ lbl = toupper(arr[i]); if(lbl ~ /^[A-D]$/){ corr[lbl]=1 } }
     next
   }
 }
 END{ flush() }
 AWK
-ok "Built parser"
 
-# --- run parser over discovered files ---
+# ========= Run parser =========
 cd "$TARGET"
-TO_PARSE="${WORKDIR}/to_parse.sh"
-printf "awk -v course='%s' -v start_num='%s' -f '%s'" "$COURSE_NAME" "$START_NUMBER" "$PARSER" > "$TO_PARSE"
+TO_PARSE="${WORKDIR}/run.awk.sh"
+printf "awk -v course='%s' -v start_num='%s' -f '%s'" "$COURSE" "$START" "$PARSER" > "$TO_PARSE"
 while IFS= read -r f; do printf " '%s'" "$f" >> "$TO_PARSE"; done < "$LIST"
-printf " >> '%s'\n" "$SQL_OUT" >> "$TO_PARSE"
+printf " >> '%s'\n" "$OUTFILE" >> "$TO_PARSE"
 bash "$TO_PARSE"
+
 cd - >/dev/null 2>&1 || true
-ok "Generated STG INSERTs"
-
-# --- append final load into main tables ---
-COURSE_SQL="${COURSE_NAME//\'/''}"
-cat >> "$SQL_OUT" <<SQL
-
--- =====================================================
--- Load staging rows into final tables for course '${COURSE_SQL}'
--- 2.1 STG_QUESTIONS → QUESTION
-INSERT INTO QUESTION (COURSE_ID, QUESTION_NUMBER, QUESTION_TEXT)
-SELECT c.ID, s.QUESTION_NUMBER, s.QUESTION_TEXT
-FROM STG_QUESTIONS s
-JOIN COURSE c ON c.NAME = s.COURSE_NAME
-WHERE c.NAME = '${COURSE_SQL}';
-
--- 2.2 STG_OPTIONS → QUESTION_OPTION
-INSERT INTO QUESTION_OPTION (QUESTION_ID, OPTION_LABEL, OPTION_TEXT, IS_CORRECT)
-SELECT q.ID, o.OPTION_LABEL, o.OPTION_TEXT, o.IS_CORRECT
-FROM STG_OPTIONS o
-JOIN COURSE c ON c.NAME = o.COURSE_NAME
-JOIN QUESTION q
-  ON q.COURSE_ID = c.ID
- AND q.QUESTION_NUMBER = o.QUESTION_NUMBER
-WHERE c.NAME = '${COURSE_SQL}';
-SQL
-ok "Appended final load (QUESTION / QUESTION_OPTION)"
-
-# --- done ---
-if command -v realpath >/dev/null 2>&1; then FULLP="$(realpath "${SQL_OUT}")"; else FULLP="${SQL_OUT}"; fi
-ok "SQL generated → ${SQL_OUT}"
-echo "Hints:"
-echo "  - Preview: head -n 80 ${SQL_OUT}"
-echo "  - H2: RUNSCRIPT FROM '${FULLP}';"
-echo "Done!"
+echo "  [OK] SQL generated → ${OUTFILE}"

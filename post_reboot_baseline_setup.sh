@@ -11,17 +11,20 @@ HEALTH_TIMEOUT=120
 
 # ==== UI ====
 GREEN='\033[32m'; RED='\033[31m'; NC='\033[0m'
-ok(){   printf "  [${GREEN}OK${NC}]  %s\n" "$1"; }   # print green OK line
-fail(){ printf "  [${RED}FAIL${NC}] %s\n" "$1"; }    # print red FAIL line
+ok(){   printf "  [${GREEN}OK${NC}]  %s\n" "$1"; }
+fail(){ printf "  [${RED}FAIL${NC}] %s\n" "$1"; }
 
 CURRENT_STEP=""
-on_error(){ echo; fail "${CURRENT_STEP:-Step failed}"; exit 1; }  # fail on any error
+on_error(){ echo; fail "${CURRENT_STEP:-Step failed}"; exit 1; }
 trap on_error ERR
 
-require_root(){ [[ $EUID -eq 0 ]] || { echo "Run as root (sudo)"; exit 1; }; }  # ensure root
+# Ensure we are root (needed for package install and system changes)
+require_root(){
+  [[ $EUID -eq 0 ]] || { echo "Run as root (sudo)"; exit 1; }
+}
 
-# Install Docker Engine + Compose plugin from Docker’s official repo
-install_docker(){  
+# Install Docker Engine and the Docker Compose plugin from Docker’s official repository
+install_docker(){
   apt-get update -y
   apt-get install -y ca-certificates curl gnupg lsb-release git
   install -d -m 0755 /etc/apt/keyrings
@@ -35,18 +38,6 @@ install_docker(){
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
   systemctl enable --now docker
   usermod -aG docker "${NEW_USER}" || true
-}
-
-# Generate an SSH keypair for ${NEW_USER} (useful if you later switch to SSH clones)
-gen_ssh_key(){  
-  local key="/home/${NEW_USER}/.ssh/id_ed25519"
-  install -d -m 0700 -o "${NEW_USER}" -g "${NEW_USER}" "/home/${NEW_USER}/.ssh"
-  if [[ ! -f "${key}" ]]; then
-    sudo -u "${NEW_USER}" ssh-keygen -q -t ed25519 -N "" -f "${key}"
-    cat "${key}.pub"
-    cp "${key}.pub" "/home/${NEW_USER}/GITHUB_SSH_KEY.pub"
-    chown "${NEW_USER}:${NEW_USER}" "/home/${NEW_USER}/GITHUB_SSH_KEY.pub"
-  fi
 }
 
 # Clone or update the target repository into APP_DIR
@@ -71,7 +62,7 @@ compose_up(){
   docker compose -f "${APP_DIR}/${compose_file}" ps
 }
 
-# Poll HEALTH_ENDPOINT until HTTP 200 or HEALTH_TIMEOUT expires
+# Poll HEALTH_ENDPOINT until HTTP 200 or until HEALTH_TIMEOUT expires
 health_check(){
   local end=$(( $(date +%s) + HEALTH_TIMEOUT ))
   until curl -fsS "${HEALTH_ENDPOINT}" >/dev/null 2>&1; do
@@ -88,17 +79,15 @@ main(){
   require_root
   echo "  [ ] Install Docker"
   echo "  [ ] Install Docker Compose (plugin)"
-  echo "  [ ] Generate SSH keypair for ${NEW_USER} (optional for HTTPS)"
   echo "  [ ] Clone repository (docker-2048)"
   echo "  [ ] Start container with Docker Compose (PORT=${APP_PORT})"
   echo "  [ ] Health-check application (${HEALTH_ENDPOINT})"
   echo
 
-  CURRENT_STEP="Install Docker";                        install_docker; ok "${CURRENT_STEP}"
-  CURRENT_STEP="Verify Docker Compose";                 docker compose version >/dev/null 2>&1 && ok "${CURRENT_STEP}"
-  CURRENT_STEP="Generate SSH keypair for ${NEW_USER}";  gen_ssh_key;    ok "${CURRENT_STEP}"
-  CURRENT_STEP="Clone repository (${REPO_URL})";        clone_repo;     ok "${CURRENT_STEP}"
-  CURRENT_STEP="Compose up (PORT=${APP_PORT})";         compose_up;     ok "${CURRENT_STEP}"
+  CURRENT_STEP="Install Docker";                  install_docker; ok "${CURRENT_STEP}"
+  CURRENT_STEP="Verify Docker Compose";           docker compose version >/dev/null 2>&1; ok "${CURRENT_STEP}"
+  CURRENT_STEP="Clone repository (${REPO_URL})";  clone_repo;     ok "${CURRENT_STEP}"
+  CURRENT_STEP="Compose up (PORT=${APP_PORT})";   compose_up;     ok "${CURRENT_STEP}"
   CURRENT_STEP="Health-check (${HEALTH_ENDPOINT})"
   if health_check; then
     ok "${CURRENT_STEP}"

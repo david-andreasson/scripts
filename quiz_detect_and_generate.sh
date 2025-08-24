@@ -12,7 +12,7 @@ GENERATOR="$HOME/scripts/quiz_md_to_sql_V2.sh"     # your generator (non-interac
 COURSE_NAME="molnintegration"                      # course name used in SQL
 NOTIFY_EMAIL="79davand@gafe.molndal.se"            # empty string => no email
 
-# Counter lives in your personal repo (default here)
+# Counter lives in your personal repo
 COUNTER_REPO_SSH="git@github.com:david-andreasson/scripts.git"
 COUNTER_BRANCH_HINT="main"
 
@@ -89,7 +89,6 @@ elif  try_clone "$COUNTER_REPO_SSH" "master"               "$COUNTER_CLONE_DIR";
 elif  try_clone "$COUNTER_REPO_SSH" ""                     "$COUNTER_CLONE_DIR"; then COUNTER_BRANCH="$(git -C "$COUNTER_CLONE_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo default)"
 else  fail "Could not clone counter repo via SSH"; exit 1
 fi
-
 COUNTER_FILE="${COUNTER_CLONE_DIR}/nextnum_${COURSE_NAME}.txt"
 
 # ===== Determine starting NEXT_NUM =====
@@ -147,6 +146,12 @@ if [ "$NEW_N" -eq 0 ] && [ "$MOD_N" -eq 0 ]; then
   ok "No new/modified quizzes."
   exit 0
 fi
+
+# ===== Affected lesson directories (unique parent dirs) =====
+CHANGED_DIRS="${WORKDIR}/changed_dirs.txt"
+cat "${WORKDIR}/new.txt" "${WORKDIR}/modified.txt" 2>/dev/null | sed '/^$/d' \
+| awk -F'/' 'NF>=1{NF=NF-1; OFS="/"; print $0}' \
+| sort -u > "$CHANGED_DIRS"
 
 # ===== Run generator per lesson dir and persist counter =====
 OUT_PARENT="$HOME/quiz_out"

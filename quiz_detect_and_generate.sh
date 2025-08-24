@@ -8,7 +8,7 @@ BRANCH_HINT="main"
 SUBROOT="8_cloud_integration/lectures"
 STATE_DIR="/var/lib/quiz_sync"
 STATE_FILE="${STATE_DIR}/seen.txt"
-GENERATOR="$HOME/quiz_md_to_sql_V2.sh"     # your generator (non-interactive)
+GENERATOR="$HOME/scripts/quiz_md_to_sql_V2.sh"     # your generator (non-interactive)  <-- changed
 COURSE_NAME="molnintegration"              # course name used in SQL
 NOTIFY_EMAIL="79davand@gafe.molndal.se"    # empty string => no email
 

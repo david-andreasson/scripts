@@ -80,6 +80,16 @@ TARGET="$CLONE_DIR/$SUBROOT"
 [ -d "$TARGET" ] || { fail "Path does not exist in repo: $SUBROOT"; exit 1; }
 ok "Target directory: $TARGET"
 
+# ===== Persistent next number in repo =====
+COUNTER_FILE="${CLONE_DIR}/nextnum_${COURSE_NAME}.txt"
+if [ -f "$COUNTER_FILE" ]; then
+  NEXT_NUM="$(awk 'NR==1 && $1 ~ /^[0-9]+$/ {print $1; exit} END{if(NR==0) print 1}' "$COUNTER_FILE")"
+  ok "Starting numbering from ${NEXT_NUM} (repo counter)"
+else
+  NEXT_NUM="$(next_start_from_sql "$COURSE_NAME")"
+  ok "Starting numbering from ${NEXT_NUM} (from existing SQL fallback)"
+fi
+
 # ===== Snapshot (path<TAB>hash) =====
 SNAP="${WORKDIR}/snapshot.tsv"
 ( cd "$TARGET"
@@ -94,6 +104,13 @@ if [ ! -s "$STATE_FILE" ]; then
   cp "$SNAP" "$STATE_FILE"
   ok "Initialized state (first run) → $STATE_FILE"
   echo "No changes to generate on first run."
+  # Skriv ut initial counter i repo om filen saknas
+  if [ ! -f "$COUNTER_FILE" ]; then
+    echo "$NEXT_NUM" > "$COUNTER_FILE"
+    git -C "$CLONE_DIR" add "$(basename "$COUNTER_FILE")" || true
+    git -C "$CLONE_DIR" -c user.email="automation@local" -c user.name="quiz-automation" commit -m "Init next number for ${COURSE_NAME} -> ${NEXT_NUM}" || true
+    git -C "$CLONE_DIR" push origin "$USED" || warn "Could not push counter init"
+  fi
   exit 0
 fi
 
@@ -129,11 +146,7 @@ cat "${WORKDIR}/new.txt" "${WORKDIR}/modified.txt" 2>/dev/null | sed '/^$/d' \
 | awk -F'/' 'NF>=1{NF=NF-1; OFS="/"; print $0}' \
 | sort -u > "$CHANGED_DIRS"
 
-# ===== Compute next start number from previous SQL =====
-NEXT_NUM="$(next_start_from_sql "$COURSE_NAME")"
-ok "Starting numbering from ${NEXT_NUM} (auto-detected from existing SQL)"
-
-# ===== Run generator per lesson dir and bump NEXT_NUM =====
+# ===== Run generator per lesson dir and persist NEXT_NUM in repo =====
 OUT_PARENT="$HOME/quiz_out"
 mkdir -p "$OUT_PARENT"
 TS="$(date +%Y%m%d_%H%M%S)"
@@ -150,6 +163,18 @@ while IFS= read -r rel_dir; do
 
   "$GENERATOR" --url "$GH_URL" --course "$COURSE_NAME" --start "$NEXT_NUM" --output "$OUT_FILE"
 
+  # Räkna hur många frågor som faktiskt skrevs och uppdatera NEXT_NUM
+  EMITTED="$(awk '/^INSERT INTO STG_QUESTIONS[[:space:]]*\(/{c++} END{print c+0}' "$OUT_FILE" 2>/dev/null || echo 0)"
+  if [ "${EMITTED:-0}" -le 0 ]; then
+    warn "No questions emitted for ${rel_dir}; numbering unchanged."
+  else
+    NEXT_NUM=$((NEXT_NUM + EMITTED))
+    echo "$NEXT_NUM" > "$COUNTER_FILE"
+    git -C "$CLONE_DIR" add "$(basename "$COUNTER_FILE")" || true
+    git -C "$CLONE_DIR" -c user.email="automation@local" -c user.name="quiz-automation" commit -m "Update next number for ${COURSE_NAME} -> ${NEXT_NUM}" || true
+    git -C "$CLONE_DIR" push origin "$USED" || warn "Could not push updated counter"
+  fi
+
   if [ -n "${NOTIFY_EMAIL:-}" ]; then
     {
       echo "Source: $GH_URL"
@@ -161,8 +186,6 @@ while IFS= read -r rel_dir; do
     } | s-nail -s "New quiz SQL: $(basename "$OUT_FILE")" "$NOTIFY_EMAIL" \
       || warn "Could not send email for $OUT_FILE"
   fi
-
-  NEXT_NUM=$((NEXT_NUM + QCOUNT))
 done < "$CHANGED_DIRS"
 
 # ===== Update state (ack) =====
